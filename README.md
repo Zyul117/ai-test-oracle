@@ -86,6 +86,3 @@ streamlit run app.py
 
 Python / Streamlit / OpenAI API / jsonschema / requests
 
-## License
-
-MIT
