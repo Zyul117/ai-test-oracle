@@ -1,0 +1,51 @@
+# 基准用例集示例 —— 展示文件格式
+#
+# 真实用例集（benchmark/cases.yaml）由实际项目用例脱敏改写，不入库。
+# 这份示例用合成数据说明格式，可直接跑：
+#     python benchmark/run_benchmark.py --cases benchmark/cases.example.yaml
+
+- id: EX-01
+  module: 用户
+  priority: P0
+  auth: token
+  title: 正常用户信息
+  method: GET
+  path: /api/user/1
+  expectation: >
+    响应应包含 user_id、name、email、balance 四个字段，
+    且 balance 账户余额不应为负数。
+  expected_verdict: pass
+
+- id: EX-02
+  module: 用户
+  priority: P0
+  auth: token
+  title: 余额为负
+  method: GET
+  path: /api/user/2
+  expectation: >
+    响应应包含 user_id、name、email、balance 四个字段，
+    且 balance 账户余额不应为负数。
+  expected_verdict: fail
+
+- id: EX-03
+  module: 订单
+  priority: P1
+  auth: token
+  title: 订单金额与明细不符
+  method: GET
+  path: /api/order/1002
+  expectation: >
+    订单 total 应等于所有 items 的 price × qty 之和。
+  expected_verdict: fail
+
+- id: EX-04
+  module: 订单
+  priority: P2
+  auth: token
+  title: 期望描述模糊（应报不确定）
+  method: GET
+  path: /api/order/1001
+  expectation: >
+    这个订单应该符合我们的业务规范。
+  expected_verdict: uncertain

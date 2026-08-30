@@ -1,6 +1,28 @@
+# Python
 __pycache__/
-*.pyc
-venv/
-.env
+*.py[cod]
 *.egg-info/
-.streamlit/
+build/
+dist/
+.eggs/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# pytest
+.pytest_cache/
+junit.xml
+
+# 环境变量（API Key 绝对不能入库）
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# 基准集：由真实项目用例脱敏而来，仅本地保留，不公开
+benchmark/cases.yaml
+benchmark/results/

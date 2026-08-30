@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-test-oracle"
+version = "0.2.0"
+description = "分层 API 测试预言机：Schema 结构校验 + LLM 语义判断，提供 pytest 插件与 Web 应用两种用法"
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "openai>=1.6.0",
+    "requests>=2.31.0",
+    "jsonschema>=4.20.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+web = ["streamlit>=1.28.0"]
+dev = ["pytest>=7.0.0"]
+
+# 注册为 pytest 插件：pip install -e . 后 ai_assert fixture 即可用
+[project.entry-points.pytest11]
+ai_oracle = "ai_oracle.plugin"
+
+[tool.setuptools.packages.find]
+include = ["ai_oracle*"]
+
+[tool.setuptools.package-data]
+ai_oracle = ["prompts/*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# marker 由插件的 pytest_configure 注册，这样在任何装了本包的项目里都生效

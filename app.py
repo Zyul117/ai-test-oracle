@@ -1,307 +1,249 @@
 """
-AI Test Oracle — Streamlit 前端界面
+AI Test Oracle — Web 界面
+
+启动：
+    pip install -e ".[web]"
+    streamlit run app.py
+
+三步流程：配置接口 → 执行判定 → 看报告
 """
 
-import streamlit as st
 import json
-import time
-from src.llm_client import LLMClient
-from src.llm_oracle import LLMOracle
-from src.schema_validator import SchemaValidator
-from src.input_generator import InputGenerator
-from src.request_runner import RequestRunner
-from src.comparator import LayeredComparator
-from src.report import ReportGenerator
+import os
 
-# ── 页面配置 ─────────────────────────────────
-st.set_page_config(
-    page_title="AI Test Oracle",
-    page_icon="🔮",
-    layout="wide",
+import streamlit as st
+
+from ai_oracle import (
+    FAIL,
+    LayeredOracle,
+    LLMClient,
+    LLMOracle,
+    PASS,
+    ReportGenerator,
+    RequestRunner,
+    SchemaValidator,
+    UNCERTAIN,
 )
-st.title("🔮 AI Test Oracle — 智能接口测试预言机")
-st.caption("解决测试中的 Oracle Problem：自动判断 API 返回结果是否正确")
 
-# ── 侧边栏：配置区 ──────────────────────────
-with st.sidebar:
-    st.header("⚙️ 配置")
+st.set_page_config(page_title="AI Test Oracle", page_icon="🔍", layout="wide")
 
-    # API 地址
-    base_url = st.text_input(
-        "目标 API 地址",
-        value="https://jsonplaceholder.typicode.com",
-        help="你要测试的 API 基础地址",
+_BADGE = {PASS: "✅ 通过", FAIL: "❌ 疑似 Bug", UNCERTAIN: "❓ 不确定"}
+
+# 示例场景：把「路径 + 接口定义 + Schema」绑在一起切换。
+# 否则改了路径忘了改 Schema，Layer 1 会因为「缺 user_id」这类无关原因报错。
+PRESETS = {
+    "余额为负（Layer 1 可抓）": {
+        "path": "/api/user/2",
+        "spec": "查询用户信息。返回 user_id(int)、name(str)、email(str)、"
+                "balance(float，账户余额，业务上不允许为负)。",
+        "schema": {"type": "object", "required": ["user_id", "name", "email"]},
+    },
+    "缺少必填字段（Layer 1 可抓）": {
+        "path": "/api/user/3",
+        "spec": "查询用户信息。user_id、name、email 均为必填字段。",
+        "schema": {"type": "object", "required": ["user_id", "name", "email"]},
+    },
+    "订单金额不自洽（需 Layer 2）": {
+        "path": "/api/order/1002",
+        "spec": "查询订单。total 应等于所有 items 的 price × qty 之和。",
+        "schema": {"type": "object", "required": ["order_id", "items", "total"]},
+    },
+    "订单状态矛盾（需 Layer 2）": {
+        "path": "/api/order/1003",
+        "spec": "查询订单。status 为订单状态，cancelled 表示是否已取消。"
+                "已取消的订单不应处于 shipped（已发货）状态。",
+        "schema": {"type": "object", "required": ["order_id", "status"]},
+    },
+    "正常数据（应判通过）": {
+        "path": "/api/user/1",
+        "spec": "查询用户信息。返回 user_id、name、email、balance。",
+        "schema": {"type": "object", "required": ["user_id", "name", "email"]},
+    },
+}
+
+
+# ----------------------------------------------------------------------
+# 侧边栏：LLM 配置
+# ----------------------------------------------------------------------
+def sidebar_config():
+    st.sidebar.header("LLM 配置")
+
+    base_url = st.sidebar.text_input(
+        "Base URL", value=os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1"),
+        help="OpenAI 兼容接口，DeepSeek / 通义千问 / GLM 都可以",
+    )
+    model = st.sidebar.text_input("模型", value=os.getenv("LLM_MODEL", "deepseek-chat"))
+    api_key = st.sidebar.text_input(
+        "API Key", value=os.getenv("OPENAI_API_KEY", ""), type="password"
     )
 
-    # LLM 配置
-    st.subheader("🤖 LLM 配置")
-    st.caption("使用兼容 OpenAI 接口的模型均可")
-    st.caption("支持 DeepSeek / 通义千问 / GLM / GPT 等")
+    if not api_key:
+        st.sidebar.warning("未填 API Key —— 只能跑第一层 Schema 校验")
+    else:
+        st.sidebar.success("已配置，两层判定都可用")
 
-    with st.expander("查看/修改 LLM 设置"):
-        api_key = st.text_input("API Key", type="password", value="sk-your-key")
-        base_url_llm = st.text_input("Base URL", value="https://api.openai.com/v1")
-        model = st.text_input("Model", value="gpt-4o-mini")
-
-    # 参数定义
-    st.subheader("📋 测试参数定义")
-    st.caption("粘贴 JSON 格式的参数列表，或使用示例")
-
-    default_params = json.dumps(
-        [
-            {"name": "userId", "type": "integer", "in": "query", "minimum": 1, "maximum": 10},
-            {"name": "id", "type": "integer", "in": "query", "minimum": 1, "maximum": 100},
-        ],
-        ensure_ascii=False,
-        indent=2,
+    st.sidebar.divider()
+    st.sidebar.caption(
+        "**判定分两层**\n\n"
+        "Layer 1 jsonschema 结构校验 — 零成本、确定性\n\n"
+        "Layer 2 LLM 语义判断 — 结构通过后才调，省 token"
     )
-    params_json = st.text_area("参数定义 (JSON)", value=default_params, height=200)
+    return base_url, model, api_key
 
-    st.divider()
-    st.caption("💡 提示：本项目解决的是测试中的 Oracle Problem")
-    st.caption("—— 如何自动判断测试结果是正确的？")
 
-# ── 主区域：三个标签页 ──────────────────────
-tab1, tab2, tab3 = st.tabs(["📝 定义接口 & 生成用例", "▶️ 执行测试", "📊 测试报告"])
+# ----------------------------------------------------------------------
+def render_verdict(verdict, title: str):
+    """统一渲染一个判定结果"""
+    label = _BADGE.get(verdict.verdict, verdict.verdict)
+    st.markdown(f"**{title}**：{label}　置信度 {verdict.confidence:.0%}")
+    if verdict.reason:
+        st.caption(verdict.reason)
 
-# ── Tab 1: 接口定义 & 生成用例 ───────────────
-with tab1:
-    st.subheader("第一步：描述你要测试的接口")
+    issues = verdict.detail.get("issues") or []
+    if issues:
+        for issue in issues:
+            st.markdown(f"- {issue}")
 
-    col1, col2 = st.columns(2)
+    extra = {k: v for k, v in verdict.detail.items() if k not in ("issues", "layer")}
+    if extra:
+        with st.expander("LLM 推理细节"):
+            st.json(extra)
 
-    with col1:
-        api_method = st.selectbox("HTTP 方法", ["GET", "POST", "PUT", "DELETE"])
-        api_path = st.text_input("接口路径", value="/posts")
 
-    with col2:
-        st.caption("接口描述（告诉 LLM 这个接口是干什么的）")
-        api_description = st.text_area(
-            "接口功能描述",
-            value="获取用户的所有帖子。支持通过 userId 筛选某个用户的帖子。返回帖子列表，每个帖子包含 userId, id, title, body。",
-            height=120,
+# ----------------------------------------------------------------------
+def main():
+    st.title("🔍 AI Test Oracle")
+    st.caption(
+        "用大模型判断 API 返回结果对不对 —— 解决传统断言只能验证预设规则、"
+        "覆盖不到业务语义缺陷的问题（Oracle Problem）"
+    )
+
+    base_url, model, api_key = sidebar_config()
+
+    tab_run, tab_assert = st.tabs(["完整流程（发请求 + 分层判定）", "单次语义断言"])
+
+    # ------------------------------------------------------------------
+    with tab_run:
+        preset_name = st.selectbox(
+            "示例场景", list(PRESETS.keys()),
+            help="切换后会同步填好路径、接口定义和 Schema；也可以自己改",
         )
+        preset = PRESETS[preset_name]
 
-    with st.expander("📄 响应 Schema（可选，用于 Layer 1 结构校验）"):
-        default_schema = json.dumps(
-            {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "userId": {"type": "integer"},
-                        "id": {"type": "integer"},
-                        "title": {"type": "string"},
-                        "body": {"type": "string"},
-                    },
-                    "required": ["userId", "id", "title", "body"],
-                },
-            },
-            indent=2,
-        )
-        schema_json = st.text_area("JSON Schema", value=default_schema, height=200)
-        response_schema = None
-        try:
-            response_schema = json.loads(schema_json)
-        except json.JSONDecodeError:
-            st.warning("Schema JSON 格式不正确，Layer 1 校验将跳过")
+        col1, col2 = st.columns(2)
 
-    # 对接下来的操作放 session_state
-    if "cases" not in st.session_state:
-        st.session_state.cases = []
-    if "api_spec_text" not in st.session_state:
-        st.session_state.api_spec_text = ""
+        with col1:
+            base = st.text_input("服务地址", value="http://127.0.0.1:8000",
+                                 help="可先运行 python mock_server.py 起本地 mock")
+            method = st.selectbox("方法", ["GET", "POST", "PUT", "DELETE"])
+            # key 带上场景名，切换场景时输入框会重置为该场景的默认值
+            path = st.text_input("路径", value=preset["path"],
+                                 key=f"path::{preset_name}")
+            body_text = st.text_area("请求体（JSON，可空）", value="", height=80)
 
-    if st.button("🚀 Step 1: 生成测试用例", type="primary"):
-        # 解析参数
-        try:
-            params_definition = json.loads(params_json)
-        except json.JSONDecodeError:
-            st.error("参数定义 JSON 格式错误，请检查")
-            params_definition = []
-
-        # 生成测试用例
-        generator = InputGenerator()
-        base_request = {
-            "method": api_method,
-            "path": api_path,
-            "headers": {"Content-Type": "application/json"},
-            "params": {},
-            "body": None,
-        }
-        cases = generator.generate(params_definition, base_request)
-
-        # 构建接口描述全文
-        api_spec_text = f"""接口功能: {api_description}
-HTTP 方法: {api_method}
-接口路径: {api_path}
-预期返回: {schema_json[:300]}"""
-
-        st.session_state.cases = cases
-        st.session_state.api_spec_text = api_spec_text
-
-        st.success(f"✅ 生成了 {len(cases)} 个测试用例")
-
-    if st.session_state.cases:
-        st.subheader(f"生成的测试用例 ({len(st.session_state.cases)} 个)")
-        for i, case in enumerate(st.session_state.cases):
-            with st.expander(f"用例 {i+1}: {case.get('test_name', '?')}"):
-                st.json(case)
-
-# ── Tab 2: 执行测试 ──────────────────────────
-with tab2:
-    st.subheader("第二步：执行测试并启动 AI Oracle")
-
-    if not st.session_state.cases:
-        st.info("👈 请先在 Tab 1 中生成测试用例")
-    else:
-        if st.button("▶️ Step 2: 执行全部测试 & AI 判断", type="primary"):
-            # 初始化组件
-            runner = RequestRunner(base_url)
-            llm_client = LLMClient()
-            # 如果用户在侧边栏填了配置，覆盖默认
-            if api_key != "sk-your-key":
-                import os
-                os.environ["OPENAI_API_KEY"] = api_key
-                os.environ["OPENAI_BASE_URL"] = base_url_llm
-                os.environ["LLM_MODEL"] = model
-                llm_client = LLMClient()
-
-            oracle = LLMOracle(llm_client)
-            comparator = LayeredComparator(oracle)
-            report_gen = ReportGenerator()
-
-            results = []
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-
-            for i, case in enumerate(st.session_state.cases):
-                test_name = case.get("test_name", f"用例{i+1}")
-                status_text.text(f"执行中: {test_name} ({i+1}/{len(st.session_state.cases)})")
-
-                # 执行请求
-                exec_result = runner.run(case)
-
-                # 分层判断
-                if exec_result.error:
-                    # 网络错误等异常
-                    oracle_result = {
-                        "test_name": test_name,
-                        "final_verdict": f"ERROR — {exec_result.error}",
-                        "findings_detail": [{
-                            "layer": "请求执行层",
-                            "verdict": "error",
-                            "detail": exec_result.error,
-                        }],
-                    }
-                elif exec_result.response_body is None:
-                    oracle_result = {
-                        "test_name": test_name,
-                        "final_verdict": "ERROR — 无响应体",
-                        "findings_detail": [],
-                    }
-                else:
-                    # 构建请求信息
-                    request_info = {
-                        "method": case.get("method", "GET"),
-                        "path": case.get("path", "/"),
-                        "params": case.get("params", {}),
-                        "body": case.get("body"),
-                    }
-                    oracle_result = comparator.validate(
-                        api_spec=st.session_state.api_spec_text,
-                        request_info=request_info,
-                        response_body=exec_result.response_body,
-                        status_code=exec_result.status_code or 0,
-                        response_schema=response_schema,
-                    )
-
-                oracle_result["test_name"] = test_name
-                oracle_result["status_code"] = exec_result.status_code
-                oracle_result["response_time_ms"] = exec_result.response_time_ms
-                oracle_result["response_body_preview"] = json.dumps(
-                    exec_result.response_body, ensure_ascii=False
-                )[:300] if exec_result.response_body else "(无)"
-                results.append(oracle_result)
-
-                progress_bar.progress((i + 1) / len(st.session_state.cases))
-                time.sleep(0.1)  # 稍微放慢，避免进度条闪太快
-
-            status_text.text("✅ 完成！")
-            st.session_state.results = results
-            st.session_state.summary = report_gen.generate_summary(results)
-
-        # 展示结果
-        if "results" in st.session_state:
-            st.subheader("🔍 AI Oracle 逐条判断结果")
-            for r in st.session_state.results:
-                verdict = r.get("final_verdict", "?")
-                if verdict.startswith("PASS"):
-                    icon = "✅"
-                elif verdict.startswith("FAIL"):
-                    icon = "❌"
-                elif verdict.startswith("ERROR"):
-                    icon = "💥"
-                else:
-                    icon = "❓"
-
-                with st.expander(f"{icon} {r.get('test_name', '?')} — HTTP {r.get('status_code', '?')} ({r.get('response_time_ms', 0)}ms)"):
-                    st.markdown(f"**最终判断:** {verdict}")
-                    st.text(f"响应预览: {r.get('response_body_preview', '')}")
-
-                    # 展示各层详情
-                    l1 = r.get("layer1")
-                    l2 = r.get("layer2")
-                    if l1:
-                        st.caption(f"Layer 1 (Schema): {'✅ 通过' if l1.get('passed') else '❌ 失败'}")
-                        for issue in l1.get("issues", []):
-                            st.caption(f"  - {issue}")
-                    if l2:
-                        st.caption(f"Layer 2 (LLM Oracle): {l2.get('verdict', '?')} (置信度: {l2.get('confidence', 0):.0%})")
-                        st.caption(f"  AI判断: {l2.get('summary', '')}")
-
-                    if r.get("cost_notes"):
-                        for note in r.get("cost_notes", []):
-                            st.caption(f"  💰 {note}")
-
-# ── Tab 3: 报告 ──────────────────────────────
-with tab3:
-    st.subheader("第三步：查看测试报告")
-
-    if "summary" not in st.session_state:
-        st.info("👈 请先在 Tab 2 中执行测试")
-    else:
-        summary = st.session_state.summary
-
-        # 指标卡片
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("总用例", summary["total"])
-        col2.metric("✅ 通过", summary["pass"])
-        col3.metric("❌ 失败", summary["fail"], delta=f"-{summary['fail']}" if summary['fail'] else None)
-        col4.metric("❓ 不确定", summary["uncertain"])
-
-        st.progress(summary["pass"] / max(summary["total"], 1))
-        st.caption(f"通过率: {summary['pass_rate']}")
-
-        # 疑似 Bug 列表
-        if summary.get("errors"):
-            st.subheader("🔴 疑似 Bug")
-            for i, err in enumerate(summary["errors"], 1):
-                with st.expander(f"Bug #{i}: {err.get('test_name', '')}"):
-                    for f in err.get("findings", []):
-                        st.markdown(f"**{f.get('layer', '')}**: {f.get('detail', '')}")
-
-        # 导出按钮
-        if st.button("📥 导出文本报告"):
-            report_gen = ReportGenerator()
-            text_report = report_gen.generate_text_report(summary)
-            st.download_button(
-                label="下载报告",
-                data=text_report,
-                file_name="ai_oracle_report.txt",
-                mime="text/plain",
+        with col2:
+            api_spec = st.text_area(
+                "接口定义", height=120, value=preset["spec"],
+                key=f"spec::{preset_name}",
             )
-            st.code(text_report)
+            schema_text = st.text_area(
+                "响应 Schema（JSON，留空则跳过 jsonschema 校验）", height=120,
+                value=json.dumps(preset["schema"], ensure_ascii=False, indent=2),
+                key=f"schema::{preset_name}",
+            )
 
-        st.divider()
-        st.caption("🔮 AI Test Oracle — 用 AI 解决测试中的 Oracle Problem")
+        if st.button("执行判定", type="primary"):
+            body = _safe_json(body_text)
+            schema = _safe_json(schema_text)
+
+            with st.spinner("发送请求…"):
+                result = RequestRunner(base).run({
+                    "test_name": f"{method} {path}", "method": method,
+                    "path": path, "body": body,
+                })
+
+            if not result.ok:
+                st.error(f"请求失败：{result.error}")
+                return
+
+            st.success(f"HTTP {result.status_code}　{result.response_time_ms} ms")
+            with st.expander("响应体", expanded=True):
+                st.json(result.response_body)
+
+            # 没 Key 时只跑 Layer 1，避免无意义的失败调用
+            if not api_key:
+                v = SchemaValidator().validate(result.response_body, schema)
+                st.info("未配置 API Key，仅执行 Layer 1")
+                render_verdict(v, "Layer 1 结构校验")
+                return
+
+            _apply_env(api_key, base_url, model)
+            with st.spinner("LLM 语义判定中…"):
+                outcome = LayeredOracle(LLMOracle(LLMClient(api_key, base_url, model))).validate(
+                    api_spec=api_spec,
+                    request_info={"method": method, "path": path, "body": body},
+                    response_body=result.response_body,
+                    status_code=result.status_code,
+                    response_schema=schema,
+                )
+
+            render_verdict(outcome["layer1"], "Layer 1 结构校验")
+            if outcome["layer2"] is None:
+                st.info("Layer 1 已发现问题，跳过 LLM 调用（省 token）")
+            else:
+                st.divider()
+                render_verdict(outcome["layer2"], "Layer 2 语义判断")
+
+            st.divider()
+            summary = ReportGenerator().summarize(
+                [{"test_name": f"{method} {path}", "verdict": outcome["final"]}]
+            )
+            st.code(ReportGenerator().to_text(summary), language=None)
+
+    # ------------------------------------------------------------------
+    with tab_assert:
+        st.caption("等价于 pytest 里的 `ai_assert(响应, 期望)`")
+        resp_text = st.text_area(
+            "响应 JSON", height=140,
+            value=json.dumps({"order_id": 1002,
+                              "items": [{"price": 50.0, "qty": 3}],
+                              "total": 100.0}, ensure_ascii=False, indent=2),
+        )
+        expectation = st.text_area(
+            "期望（自然语言）", height=80,
+            value="订单 total 应该等于所有 items 的 price × qty 之和",
+        )
+
+        if st.button("语义判定", type="primary", key="assert_btn"):
+            if not api_key:
+                st.error("这一页必须配置 API Key")
+                return
+            _apply_env(api_key, base_url, model)
+            with st.spinner("判定中…"):
+                v = LLMOracle(LLMClient(api_key, base_url, model)).judge_expectation(
+                    _safe_json(resp_text), expectation
+                )
+            render_verdict(v, "语义断言")
+
+
+def _safe_json(text: str):
+    """空文本返回 None，解析失败给提示而不是崩掉"""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        st.warning(f"JSON 解析失败，已按空处理：{e}")
+        return None
+
+
+def _apply_env(api_key: str, base_url: str, model: str):
+    """回填环境变量，让底层默认构造也能拿到界面上的配置"""
+    os.environ["OPENAI_API_KEY"] = api_key
+    os.environ["OPENAI_BASE_URL"] = base_url
+    os.environ["LLM_MODEL"] = model
+
+
+if __name__ == "__main__":
+    main()
